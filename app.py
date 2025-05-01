@@ -525,7 +525,8 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
             
             # Calcular duração total necessária
             narration_duration = narration_audio.duration
-            total_duration = mix_request.wait_music + narration_duration + mix_request.fade_end_at + 3  # +3 para o fadeout
+            fadeout_duration = 3.0  # Duração do fadeout em segundos
+            total_duration = mix_request.wait_music + narration_duration + mix_request.fade_end_at + fadeout_duration
             
             # Verifique se a música é longa o suficiente, caso contrário, faça um loop
             if music_audio.duration < total_duration:
@@ -540,15 +541,25 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
             
             # Calcular quando o fadeout deve começar
             fadeout_start = mix_request.wait_music + narration_duration + mix_request.fade_end_at
-            fadeout_duration = 3.0  # Duração do fadeout em segundos
             
             # Reduzir o volume da música para não sobrepor a narração (50% do volume)
             background_volume = 0.5
             music_audio = music_audio.volumex(background_volume)
             
-            # Aplicar o fadeout na música
-            music_with_fadeout = music_audio.copy()
-            music_with_fadeout = music_with_fadeout.audio_fadeout(fadeout_duration, fadeout_start)
+            # Criar uma função de volume para aplicar o fadeout
+            def volume_func(t):
+                if t < fadeout_start:
+                    return 1.0
+                elif t >= fadeout_start + fadeout_duration:
+                    return 0.0
+                else:
+                    # Fadeout linear
+                    return 1.0 - ((t - fadeout_start) / fadeout_duration)
+            
+            # Aplicar a função de volume à música
+            music_with_fadeout = music_audio.fl(lambda clip: clip.fl_time(lambda t: t, 
+                                                         apply_to=['mask', 'audio']))
+            music_with_fadeout = music_with_fadeout.volumex(volume_func)
             
             # Combinar narração e música
             final_audio = mp.CompositeAudioClip([music_with_fadeout, narration_with_delay])
