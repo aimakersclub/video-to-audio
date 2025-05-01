@@ -411,6 +411,186 @@ async def shutdown_event():
     except Exception as e:
         print(f"Error during cleanup: {str(e)}")
 
+
+class AudioMixRequest(BaseModel):
+    audio: Optional[str] = None
+    audio_base64: Optional[str] = None
+    wait_music: int = 0
+    music: Optional[str] = None
+    music_base64: Optional[str] = None
+    fade_end_at: int = 0
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "audio": "narration.mp3",
+                "audio_base64": "base64_encoded_narration",
+                "wait_music": 3,
+                "music": "background.mp3",
+                "music_base64": "base64_encoded_music",
+                "fade_end_at": 4
+            }
+        }
+
+class AudioMixResponse(BaseModel):
+    download_url: str
+    base64_data: Optional[str] = None
+    mimetype: str
+    filename: str
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "download_url": "/download/mixed_12345.mp3",
+                "base64_data": "base64_encoded_string_here",
+                "mimetype": "audio/mp3",
+                "filename": "mixed_audio.mp3"
+            }
+        }
+
+@app.post("/mix-audio", response_model=AudioMixResponse)
+async def mix_audio(mix_request: AudioMixRequest = Body(...)):
+    """
+    Combina um áudio de narração com música de fundo.
+    A narração começa após o tempo especificado em wait_music.
+    Após o término da narração, espera o tempo fade_end_at e aplica um fadeout na música.
+    """
+    try:
+        # Validação de entradas
+        if (not mix_request.audio and not mix_request.audio_base64) or \
+           (not mix_request.music and not mix_request.music_base64):
+            raise HTTPException(
+                status_code=400, 
+                detail="É necessário fornecer tanto o áudio de narração quanto a música de fundo"
+            )
+        
+        # Gerar nomes de arquivos únicos
+        unique_id = str(uuid.uuid4())[:8]
+        narration_filename = f"narration_{unique_id}.mp3"
+        music_filename = f"music_{unique_id}.mp3"
+        output_filename = f"mixed_{unique_id}.mp3"
+        
+        narration_path = os.path.join(TEMP_DIR, narration_filename)
+        music_path = os.path.join(TEMP_DIR, music_filename)
+        output_path = os.path.join(TEMP_DIR, output_filename)
+        
+        # Processamento do áudio de narração
+        if mix_request.audio_base64:
+            try:
+                # Extract actual base64 data if it contains metadata
+                if "," in mix_request.audio_base64:
+                    base64_data = mix_request.audio_base64.split(",")[1]
+                else:
+                    base64_data = mix_request.audio_base64
+                    
+                audio_data = base64.b64decode(base64_data)
+                with open(narration_path, "wb") as f:
+                    f.write(audio_data)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Dados base64 inválidos para áudio: {str(e)}")
+        elif mix_request.audio:
+            # Verificar se o arquivo existe no diretório temp
+            source_path = os.path.join(TEMP_DIR, mix_request.audio)
+            if not os.path.exists(source_path):
+                raise HTTPException(status_code=404, detail=f"Arquivo de áudio '{mix_request.audio}' não encontrado")
+            # Copiar o arquivo para o novo caminho
+            shutil.copy(source_path, narration_path)
+        
+        # Processamento da música de fundo
+        if mix_request.music_base64:
+            try:
+                # Extract actual base64 data if it contains metadata
+                if "," in mix_request.music_base64:
+                    base64_data = mix_request.music_base64.split(",")[1]
+                else:
+                    base64_data = mix_request.music_base64
+                    
+                music_data = base64.b64decode(base64_data)
+                with open(music_path, "wb") as f:
+                    f.write(music_data)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Dados base64 inválidos para música: {str(e)}")
+        elif mix_request.music:
+            # Verificar se o arquivo existe no diretório temp
+            source_path = os.path.join(TEMP_DIR, mix_request.music)
+            if not os.path.exists(source_path):
+                raise HTTPException(status_code=404, detail=f"Arquivo de música '{mix_request.music}' não encontrado")
+            # Copiar o arquivo para o novo caminho
+            shutil.copy(source_path, music_path)
+        
+        # Carregar os arquivos de áudio com MoviePy
+        try:
+            narration_audio = mp.AudioFileClip(narration_path)
+            music_audio = mp.AudioFileClip(music_path)
+            
+            # Calcular duração total necessária
+            narration_duration = narration_audio.duration
+            total_duration = mix_request.wait_music + narration_duration + mix_request.fade_end_at + 3  # +3 para o fadeout
+            
+            # Verifique se a música é longa o suficiente, caso contrário, faça um loop
+            if music_audio.duration < total_duration:
+                loops_needed = int(total_duration / music_audio.duration) + 1
+                music_audio = mp.concatenate_audioclips([music_audio] * loops_needed)
+            
+            # Cortar a música para a duração total necessária
+            music_audio = music_audio.subclip(0, total_duration)
+            
+            # Aplicar o atraso (wait_music) à narração
+            narration_with_delay = narration_audio.set_start(mix_request.wait_music)
+            
+            # Calcular quando o fadeout deve começar
+            fadeout_start = mix_request.wait_music + narration_duration + mix_request.fade_end_at
+            fadeout_duration = 3.0  # Duração do fadeout em segundos
+            
+            # Reduzir o volume da música para não sobrepor a narração (50% do volume)
+            background_volume = 0.5
+            music_audio = music_audio.volumex(background_volume)
+            
+            # Aplicar o fadeout na música
+            music_with_fadeout = music_audio.copy()
+            music_with_fadeout = music_with_fadeout.audio_fadeout(fadeout_duration, fadeout_start)
+            
+            # Combinar narração e música
+            final_audio = mp.CompositeAudioClip([music_with_fadeout, narration_with_delay])
+            final_audio = final_audio.set_duration(total_duration)
+            
+            # Salvar o resultado
+            final_audio.write_audiofile(output_path, fps=44100, nbytes=2, codec='libmp3lame')
+            
+            # Limpar os arquivos temporários 
+            for path in [narration_path, music_path]:
+                if os.path.exists(path):
+                    os.remove(path)
+            
+            # Criar URL de download e dados base64 para resposta
+            download_url = f"/download/{output_filename}"
+            
+            with open(output_path, "rb") as audio_file:
+                audio_data = audio_file.read()
+                base64_audio = base64.b64encode(audio_data).decode("utf-8")
+            
+            return AudioMixResponse(
+                download_url=download_url,
+                base64_data=base64_audio,
+                mimetype="audio/mp3",
+                filename=output_filename
+            )
+            
+        except Exception as e:
+            # Limpar arquivos em caso de erro
+            for path in [narration_path, music_path, output_path]:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+            raise HTTPException(status_code=500, detail=f"Erro ao processar áudio: {str(e)}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro do servidor: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
