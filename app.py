@@ -526,52 +526,101 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
             # Calcular duração total necessária
             narration_duration = narration_audio.duration
             fadeout_duration = 3.0  # Duração do fadeout em segundos
-            
-            # Calcular quando o fadeout deve começar
-            fadeout_start = mix_request.wait_music + narration_duration + mix_request.fade_end_at
-            total_duration = fadeout_start + fadeout_duration
+            total_duration = mix_request.wait_music + narration_duration + mix_request.fade_end_at + fadeout_duration
             
             # Verifique se a música é longa o suficiente, caso contrário, faça um loop
             if music_audio.duration < total_duration:
+                # Para evitar problemas com o loop, vamos usar ffmpeg para concatenar a música 
+                # várias vezes em um novo arquivo
+                temp_extended_music = os.path.join(TEMP_DIR, f"extended_{music_filename}")
                 loops_needed = int(total_duration / music_audio.duration) + 1
-                music_audio = mp.concatenate_audioclips([music_audio] * loops_needed)
+                
+                # Fechamos o clip para evitar problemas com arquivos abertos
+                music_audio.close()
+                
+                # Usar FFmpeg diretamente para duplicar o arquivo várias vezes
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-stream_loop", str(loops_needed - 1),
+                    "-i", music_path,
+                    "-c", "copy",
+                    temp_extended_music
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # Reabrir o arquivo estendido
+                music_audio = mp.AudioFileClip(temp_extended_music)
+            
+            # Reduzir o volume da música para não sobrepor a narração
+            background_volume = 0.3  # 30% do volume original
+            music_audio = music_audio.volumex(background_volume)
             
             # Cortar a música para a duração total necessária
             music_audio = music_audio.subclip(0, total_duration)
             
-            # Reduzir o volume da música para não sobrepor a narração (30% do volume original)
-            background_volume = 0.3
-            music_audio = music_audio.volumex(background_volume)
+            # Criar o arquivo da narração com delay
+            # Primeiro criamos um arquivo de silêncio para o início
+            silence_path = os.path.join(TEMP_DIR, f"silence_{unique_id}.mp3")
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", f"anullsrc=r=44100:cl=stereo:d={mix_request.wait_music}",
+                "-acodec", "libmp3lame",
+                silence_path
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
-            # Criar três partes da música: antes, durante e depois da narração
-            # 1. Música até o inicio da narração (wait_music)
-            # 2. Música durante a narração
-            # 3. Música após o fim da narração com fadeout
+            # Concatenamos o silêncio + narração para criar o áudio com delay
+            silence_audio = mp.AudioFileClip(silence_path)
+            narration_with_delay = mp.concatenate_audioclips([silence_audio, narration_audio])
             
-            part1 = music_audio.subclip(0, mix_request.wait_music)
-            part2 = music_audio.subclip(mix_request.wait_music, fadeout_start)
-            part3 = music_audio.subclip(fadeout_start, total_duration)
+            # Determinar o ponto de início do fadeout
+            fadeout_point = mix_request.wait_music + narration_duration + mix_request.fade_end_at
             
-            # Aplicar fadeout na parte 3
-            part3 = part3.fx(mp.vfx.fadeout, fadeout_duration)
+            # Aplicar fadeout usando ffmpeg em um arquivo temporário
+            music_with_fadeout_path = os.path.join(TEMP_DIR, f"music_fadeout_{unique_id}.mp3")
             
-            # Recombinar as partes da música
-            music_final = mp.concatenate_audioclips([part1, part2, part3])
+            # Primeiro salvamos a música sem fadeout
+            music_without_fadeout_path = os.path.join(TEMP_DIR, f"music_no_fadeout_{unique_id}.mp3")
+            music_audio.write_audiofile(music_without_fadeout_path, fps=44100, nbytes=2, codec='libmp3lame')
             
-            # Aplicar o atraso (wait_music) à narração
-            narration_with_delay = narration_audio.set_start(mix_request.wait_music)
+            # Fechamos para liberar recursos
+            music_audio.close()
             
-            # Combinar narração e música
-            final_audio = mp.CompositeAudioClip([music_final, narration_with_delay])
+            # Aplicamos o fadeout com FFmpeg
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", music_without_fadeout_path,
+                "-af", f"afade=t=out:st={fadeout_point}:d={fadeout_duration}",
+                music_with_fadeout_path
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # Recarregar o áudio com fadeout
+            music_with_fadeout = mp.AudioFileClip(music_with_fadeout_path)
+            
+            # Combinar os dois áudios
+            final_audio = mp.CompositeAudioClip([music_with_fadeout, narration_with_delay])
             final_audio = final_audio.set_duration(total_duration)
             
-            # Salvar o resultado
+            # Salvar o resultado final
             final_audio.write_audiofile(output_path, fps=44100, nbytes=2, codec='libmp3lame')
             
-            # Limpar os arquivos temporários 
-            for path in [narration_path, music_path]:
+            # Limpar arquivos temporários
+            for path in [narration_path, music_path, silence_path, 
+                         music_without_fadeout_path, music_with_fadeout_path]:
                 if os.path.exists(path):
-                    os.remove(path)
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+            
+            # Se criamos um arquivo de música estendido, vamos limpar também
+            if 'temp_extended_music' in locals() and os.path.exists(temp_extended_music):
+                try:
+                    os.remove(temp_extended_music)
+                except:
+                    pass
             
             # Criar URL de download e dados base64 para resposta
             download_url = f"/download/{output_filename}"
@@ -595,6 +644,21 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
                         os.remove(path)
                     except:
                         pass
+            # Se temos arquivos temporários adicionais, limpar também
+            temp_files = [
+                f"silence_{unique_id}.mp3", 
+                f"music_fadeout_{unique_id}.mp3",
+                f"music_no_fadeout_{unique_id}.mp3",
+                f"extended_{music_filename}"
+            ]
+            for filename in temp_files:
+                path = os.path.join(TEMP_DIR, filename)
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+            
             raise HTTPException(status_code=500, detail=f"Erro ao processar áudio: {str(e)}")
     
     except HTTPException:
