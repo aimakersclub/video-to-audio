@@ -419,6 +419,7 @@ class AudioMixRequest(BaseModel):
     music: Optional[str] = None
     music_base64: Optional[str] = None
     fade_end_at: int = 0
+    music_volume: float = 0.3  # Volume da música (0.0 a 1.0)
     
     class Config:
         schema_extra = {
@@ -428,7 +429,8 @@ class AudioMixRequest(BaseModel):
                 "wait_music": 3,
                 "music": "background.mp3",
                 "music_base64": "base64_encoded_music",
-                "fade_end_at": 4
+                "fade_end_at": 4,
+                "music_volume": 0.5
             }
         }
 
@@ -454,6 +456,7 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
     Combina um áudio de narração com música de fundo.
     A narração começa após o tempo especificado em wait_music.
     Após o término da narração, espera o tempo fade_end_at e aplica um fadeout na música.
+    O volume da música pode ser ajustado com music_volume (0.0 a 1.0).
     """
     try:
         # Validação de entradas
@@ -462,6 +465,13 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
             raise HTTPException(
                 status_code=400, 
                 detail="É necessário fornecer tanto o áudio de narração quanto a música de fundo"
+            )
+        
+        # Validar o volume da música
+        if mix_request.music_volume < 0.0 or mix_request.music_volume > 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="O volume da música deve estar entre 0.0 e 1.0"
             )
         
         # Gerar nomes de arquivos únicos
@@ -551,9 +561,8 @@ async def mix_audio(mix_request: AudioMixRequest = Body(...)):
                 # Reabrir o arquivo estendido
                 music_audio = mp.AudioFileClip(temp_extended_music)
             
-            # Reduzir o volume da música para não sobrepor a narração
-            background_volume = 0.3  # 30% do volume original
-            music_audio = music_audio.volumex(background_volume)
+            # Ajustar o volume da música conforme o parâmetro fornecido
+            music_audio = music_audio.volumex(mix_request.music_volume)
             
             # Cortar a música para a duração total necessária
             music_audio = music_audio.subclip(0, total_duration)
